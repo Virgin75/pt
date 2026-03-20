@@ -1,0 +1,2 @@
+# pt
+Pytest compress output
