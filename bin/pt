@@ -1,0 +1,196 @@
+#!/usr/bin/env bash
+log_dir=".pytest_errors"
+progress_file="$log_dir/.pt_progress"
+tmp_dir=$(mktemp -d)
+
+rm -rf "$log_dir"
+mkdir -p "$log_dir"
+
+cleanup() {
+    rm -rf "$tmp_dir"
+}
+trap cleanup EXIT
+
+cat > "$tmp_dir/pt_progress_hook.py" << 'HOOK'
+import os as _os
+
+_progress_file = _os.environ.get("PT_PROGRESS_FILE", ".pytest_errors/.pt_progress")
+_is_worker = bool(_os.environ.get("PYTEST_XDIST_WORKER"))
+_header_written = False
+
+def _write_header(total):
+    global _header_written
+    if _header_written:
+        return
+    _header_written = True
+    try:
+        _os.makedirs(_os.path.dirname(_progress_file), exist_ok=True)
+        with open(_progress_file, "w") as f:
+            f.write("0/" + str(total) + "\n")
+    except Exception:
+        pass
+
+def pytest_collection_finish(session):
+    # Fires in workers (with xdist) and in controller (without xdist)
+    if not _is_worker:
+        _write_header(len(session.items))
+
+def pytest_xdist_node_collection_finished(node, ids):
+    # Fires on controller once per worker — first call gives us the total
+    _write_header(len(ids))
+
+def pytest_runtest_logreport(report):
+    if _is_worker:
+        return
+    if report.when == "call" or (report.when == "setup" and report.failed):
+        try:
+            with open(_progress_file, "a") as f:
+                f.write("F\n" if report.failed else "1\n")
+        except Exception:
+            pass
+HOOK
+
+start_time=$(date +%s)
+spinner_chars='⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏'
+
+(
+    if [ -t 2 ]; then
+        # TTY: overwrite same line with \r
+        while true; do
+            for (( i=0; i<${#spinner_chars}; i++ )); do
+                elapsed=$(( $(date +%s) - start_time ))
+                if [ -f "$progress_file" ]; then
+                    total=$(awk -F/ 'NR==1{print $2}' "$progress_file" || true)
+                    if [ -n "$total" ]; then
+                        done=$(( $(wc -l < "$progress_file") - 1 ))
+                        pct=$(( done * 100 / total ))
+                        if grep -q '^F$' "$progress_file"; then
+                            color='\033[0;31m'
+                        else
+                            color='\033[0;32m'
+                        fi
+                        reset='\033[0m'
+                        printf "\r%s ⏱ %ds | ${color}%d/%d (%d%%)${reset}" "${spinner_chars:$i:1}" "$elapsed" "$done" "$total" "$pct" >&2
+                    else
+                        printf "\r%s ⏱ %ds" "${spinner_chars:$i:1}" "$elapsed" >&2
+                    fi
+                else
+                    printf "\r%s ⏱ %ds" "${spinner_chars:$i:1}" "$elapsed" >&2
+                fi
+                sleep 0.1
+            done
+        done
+    else
+        # Non-TTY (captured): print only at each 10% milestone
+        last_pct=-1
+        while true; do
+            elapsed=$(( $(date +%s) - start_time ))
+            if [ -f "$progress_file" ]; then
+                total=$(awk -F/ 'NR==1{print $2}' "$progress_file" || true)
+                if [ -n "$total" ]; then
+                    done=$(( $(wc -l < "$progress_file") - 1 ))
+                    pct=$(( done * 100 / total ))
+                    milestone=$(( pct / 10 ))
+                    if [ "$milestone" != "$last_pct" ]; then
+                        printf "⏱ %ds | %d/%d (%d%%)\n" "$elapsed" "$done" "$total" "$pct" >&2
+                        last_pct=$milestone
+                    fi
+                fi
+            fi
+            sleep 0.1
+        done
+    fi
+) &
+spinner_pid=$!
+
+PT_PROGRESS_FILE="$(pwd)/$progress_file" PYTHONPATH="$tmp_dir${PYTHONPATH:+:$PYTHONPATH}" pytest -vv -p no:warnings -p pt_progress_hook -o junit_family=xunit2 --junitxml="$(pwd)/$log_dir/report.xml" "$@" > "$log_dir/console.log" 2>&1
+
+kill "$spinner_pid" 2>/dev/null
+wait "$spinner_pid" 2>/dev/null
+printf "\r\033[K" >&2
+
+python3 << 'PYEOF'
+import xml.etree.ElementTree as ET
+import os
+import re
+
+RED = "\033[0;31m"
+GREEN = "\033[0;32m"
+BLUE = "\033[0;34m"
+NC = "\033[0m"
+
+log_dir = ".pytest_errors"
+report_file = log_dir + "/report.xml"
+
+if not os.path.exists(report_file):
+    print(RED + "🚨 Pytest failed to execute. Console output:" + NC)
+    with open(log_dir + "/console.log", "r") as f:
+        print(f.read())
+    exit(1)
+
+try:
+    tree = ET.parse(report_file)
+    root = tree.getroot()
+except Exception as e:
+    print(RED + "🚨 Failed to parse test report." + NC)
+    exit(1)
+
+suite = root.find("testsuite") if root.tag == "testsuites" else root
+if suite is None and root.tag == "testsuite":
+    suite = root
+
+tests = int(suite.get("tests", 0))
+failures = int(suite.get("failures", 0))
+errors = int(suite.get("errors", 0))
+skipped = int(suite.get("skipped", 0))
+
+total_fails = failures + errors
+passed = tests - total_fails - skipped
+
+summary = []
+if total_fails > 0: summary.append(RED + str(total_fails) + " failed" + BLUE)
+if passed > 0: summary.append(GREEN + str(passed) + " passed" + BLUE)
+if skipped > 0: summary.append(str(skipped) + " skipped")
+
+summary_str = ", ".join(summary) if summary else "0 tests ran"
+
+print(BLUE + "📊 Test Summary: " + summary_str + NC)
+print(BLUE + "----------------------------------------" + NC)
+
+if total_fails == 0:
+    print(GREEN + "All tests passed! 🚀" + NC)
+else:
+    print("Here are all failed tests:")
+
+    for testcase in suite.findall(".//testcase"):
+        failure = testcase.find("failure")
+        if failure is None:
+            failure = testcase.find("error")
+
+        if failure is not None:
+            file_path = testcase.get("file")
+            line = testcase.get("line")
+            name = testcase.get("name", "unknown_test")
+            msg = failure.get("message", "Error").split("\n")[0]
+            trace_text = failure.text or msg
+
+            if not file_path or file_path == "unknown":
+                classname = testcase.get("classname", "")
+                if classname:
+                    file_path = classname.replace(".", "/") + ".py"
+                else:
+                    file_path = "unknown"
+
+            if not line or line == "?":
+                match = re.search(r":(\d+): ", trace_text)
+                if match:
+                    line = match.group(1)
+                else:
+                    line = "?"
+
+            trace_file = log_dir + "/" + name + ".log"
+            with open(trace_file, "w", encoding="utf-8") as f:
+                f.write(trace_text)
+
+            print("- " + RED + file_path + ":" + str(line) + ": " + msg + NC + " 📂 [Trace: " + trace_file + "]")
+PYEOF
